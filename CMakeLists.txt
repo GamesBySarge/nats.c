@@ -155,7 +155,7 @@ if(UNIX)
   set(NATS_MEMCHECK_CMD_OPTS "--leak-check=full --track-fds=yes --show-reachable=yes --num-callers=50" CACHE STRING "Memcheck options")
   set(MEMORYCHECK_COMMAND_OPTIONS ${NATS_MEMCHECK_CMD_OPTS} CACHE INTERNAL "")
 
-  set(NATS_COMMON_C_FLAGS "-std=c99 -pedantic")
+  set(NATS_COMMON_C_FLAGS "-std=c99 -pedantic -fPIC")
 
   # Some compiler hardening flags.
   if(NATS_COMPILER_HARDENING)
