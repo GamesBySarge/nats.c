@@ -1380,6 +1380,14 @@ _marshalConsumerCreateReq(natsBuffer **new_buf, const char *stream, jsConsumerCo
     natsStatus      s    = NATS_OK;
     natsBuffer      *buf = NULL;
 
+    // If not set, set some defaults
+    if ((int) cfg->DeliverPolicy < 0)
+        cfg->DeliverPolicy = js_DeliverAll;
+    if ((int) cfg->AckPolicy < 0)
+        cfg->AckPolicy = js_AckExplicit;
+    if ((int) cfg->ReplayPolicy < 0)
+        cfg->ReplayPolicy = js_ReplayInstant;
+
     s = natsBuf_Create(&buf, 256);
     IFOK(s, natsBuf_Append(buf, "{\"stream_name\":\"", -1));
     IFOK(s, natsBuf_Append(buf, stream, -1));
@@ -1403,6 +1411,12 @@ _marshalConsumerCreateReq(natsBuffer **new_buf, const char *stream, jsConsumerCo
     {
         s = natsBuf_Append(buf, ",\"deliver_subject\":\"", -1);
         IFOK(s, natsBuf_Append(buf, cfg->DeliverSubject, -1));
+        IFOK(s, natsBuf_AppendByte(buf, '"'));
+    }
+    if ((s == NATS_OK) && (!nats_IsStringEmpty(cfg->DeliverGroup)))
+    {
+        s = natsBuf_Append(buf, ",\"deliver_group\":\"", -1);
+        IFOK(s, natsBuf_Append(buf, cfg->DeliverGroup, -1));
         IFOK(s, natsBuf_AppendByte(buf, '"'));
     }
     if ((s == NATS_OK) && (cfg->OptStartSeq > 0))
@@ -1456,6 +1470,7 @@ _destroyConsumerConfig(jsConsumerConfig *cc)
     NATS_FREE((char*) cc->Durable);
     NATS_FREE((char*) cc->Description);
     NATS_FREE((char*) cc->DeliverSubject);
+    NATS_FREE((char*) cc->DeliverGroup);
     NATS_FREE((char*) cc->FilterSubject);
     NATS_FREE((char*) cc->SampleFrequency);
     NATS_FREE(cc);
@@ -1554,6 +1569,7 @@ _unmarshalConsumerConfig(nats_JSON *json, const char *fieldName, jsConsumerConfi
         s = nats_JSONGetStr(cjson, "durable_name", (char**) &(cc->Durable));
         IFOK(s, nats_JSONGetStr(cjson, "description", (char**) &(cc->Description)));
         IFOK(s, nats_JSONGetStr(cjson, "deliver_subject", (char**) &(cc->DeliverSubject)));
+        IFOK(s, nats_JSONGetStr(cjson, "deliver_group", (char**) &(cc->DeliverGroup)));
         IFOK(s, _unmarshalDeliverPolicy(cjson, "deliver_policy", &(cc->DeliverPolicy)));
         IFOK(s, nats_JSONGetULong(cjson, "opt_start_seq", &(cc->OptStartSeq)));
         IFOK(s, nats_JSONGetTime(cjson, "opt_start_time", &(cc->OptStartTime)));
@@ -1579,16 +1595,17 @@ _unmarshalConsumerConfig(nats_JSON *json, const char *fieldName, jsConsumerConfi
 }
 
 static natsStatus
-_unmarshalSeqPair(nats_JSON *json, const char *fieldName, jsSequencePair *sp)
+_unmarshalSeqInfo(nats_JSON *json, const char *fieldName, jsSequenceInfo *si)
 {
     natsStatus  s    = NATS_OK;
-    nats_JSON   *spj = NULL;
+    nats_JSON   *sij = NULL;
 
-    s = nats_JSONGetObject(json, fieldName, &spj);
-    if ((s == NATS_OK) && (spj != NULL))
+    s = nats_JSONGetObject(json, fieldName, &sij);
+    if ((s == NATS_OK) && (sij != NULL))
     {
-        IFOK(s, nats_JSONGetULong(spj, "consumer_seq", &(sp->Consumer)));
-        IFOK(s, nats_JSONGetULong(spj, "stream_seq", &(sp->Stream)));
+        IFOK(s, nats_JSONGetULong(sij, "consumer_seq", &(si->Consumer)));
+        IFOK(s, nats_JSONGetULong(sij, "stream_seq", &(si->Stream)));
+        IFOK(s, nats_JSONGetTime(sij, "last_active", &(si->Last)));
     }
     return NATS_UPDATE_ERR_STACK(s);
 }
@@ -1607,13 +1624,14 @@ js_unmarshalConsumerInfo(nats_JSON *json, jsConsumerInfo **new_ci)
     IFOK(s, nats_JSONGetStr(json, "name", &(ci->Name)));
     IFOK(s, nats_JSONGetTime(json, "created", &(ci->Created)));
     IFOK(s, _unmarshalConsumerConfig(json, "config", &(ci->Config)));
-    IFOK(s, _unmarshalSeqPair(json, "delivered", &(ci->Delivered)));
-    IFOK(s, _unmarshalSeqPair(json, "ack_floor", &(ci->AckFloor)));
+    IFOK(s, _unmarshalSeqInfo(json, "delivered", &(ci->Delivered)));
+    IFOK(s, _unmarshalSeqInfo(json, "ack_floor", &(ci->AckFloor)));
     IFOK(s, nats_JSONGetLong(json, "num_ack_pending", &(ci->NumAckPending)));
     IFOK(s, nats_JSONGetLong(json, "num_redelivered", &(ci->NumRedelivered)));
     IFOK(s, nats_JSONGetLong(json, "num_waiting", &(ci->NumWaiting)));
     IFOK(s, nats_JSONGetULong(json, "num_pending", &(ci->NumPending)));
     IFOK(s, _unmarshalClusterInfo(json, "cluster", &(ci->Cluster)));
+    IFOK(s, nats_JSONGetBool(json, "push_bound", &(ci->PushBound)));
 
     if (s == NATS_OK)
         *new_ci = ci;
@@ -1813,7 +1831,7 @@ js_DeleteConsumer(jsCtx *js, const char *stream, const char *consumer,
     // If we got a response, check for error and success result.
     IFOK(s, _unmarshalSuccessResp(&success, resp, errCode));
     if ((s == NATS_OK) && !success)
-        s = nats_setError(NATS_ERR, "failed to delete consumer '%s'", consumer);
+        s = nats_setError(s, "failed to delete consumer '%s'", consumer);
 
     NATS_FREE(subj);
     natsMsg_Destroy(resp);
@@ -1828,6 +1846,9 @@ jsConsumerConfig_Init(jsConsumerConfig *cc)
         return nats_setDefaultError(NATS_INVALID_ARG);
 
     memset(cc, 0, sizeof(jsConsumerConfig));
+    cc->AckPolicy       = -1;
+    cc->DeliverPolicy   = -1;
+    cc->ReplayPolicy    = -1;
     return NATS_OK;
 }
 

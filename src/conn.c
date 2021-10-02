@@ -2518,9 +2518,7 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
     // For JetStream cases
     jsSub            *jsi    = NULL;
     bool             ctrlMsg = false;
-    bool             hasHBs  = false;
-    bool             hasFC   = false;
-    bool             fcReply = false;
+    const char       *fcReply= NULL;
     int              jct     = 0;
 
     natsMutex_Lock(nc->subsMu);
@@ -2575,9 +2573,14 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
 
     if ((jsi = sub->jsi) != NULL)
     {
-        hasHBs = (jsi->hbi > 0 ? true : false);
-        hasFC  = jsi->hasFC;
-        ctrlMsg= natsMsg_isJSCtrl(msg, &jct);
+        ctrlMsg = natsMsg_isJSCtrl(msg, &jct);
+        if (ctrlMsg && jct == jsCtrlHeartbeat)
+        {
+            // Check if the hearbeat has a "Consumer Stalled" header, if
+            // so, the value is the FC reply to send a nil message to.
+            // We will send it at the end of this function.
+            natsMsgHeader_Get(msg, jsConsumerStalledHdr, &fcReply);
+        }
     }
 
     if (!ctrlMsg)
@@ -2628,20 +2631,20 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
 
             // Store the ACK metadata from the message to
             // compare later on with the received heartbeat.
-            if ((jsi != NULL) && hasHBs)
+            if (jsi != NULL)
                 s = jsSub_trackSequences(jsi, msg->reply);
         }
     }
-    else if (hasHBs && (jct == jsCtrlHeartbeat) && (msg->reply == NULL))
+    else if ((jct == jsCtrlHeartbeat) && (msg->reply == NULL))
     {
         // Handle control heartbeat messages.
         s = jsSub_processSequenceMismatch(sub, msg, &sm);
     }
-    else if (hasFC && (jct == jsCtrlFlowControl) && (msg->reply != NULL))
+    else if ((jct == jsCtrlFlowControl) && (msg->reply != NULL))
     {
         // If we have no pending, go ahead and send in place.
         if (sub->msgList.msgs == 0)
-            fcReply = true;
+            fcReply = msg->reply;
         else
         {
             // Schedule a reply after the previous message is delivered.
@@ -2652,7 +2655,7 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
     natsMutex_Unlock(mu);
 
     if ((s == NATS_OK) && fcReply)
-        s = natsConnection_Publish(nc, msg->reply, NULL, 0);
+        s = natsConnection_Publish(nc, fcReply, NULL, 0);
 
     if (ctrlMsg)
         natsMsg_Destroy(msg);
@@ -2664,7 +2667,7 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
         nc->err = (sc ? NATS_SLOW_CONSUMER : NATS_MISMATCH);
 
         if (nc->opts->asyncErrCb != NULL)
-            natsAsyncCb_PostErrHandler(nc, sub, nc->err);
+            natsAsyncCb_PostErrHandler(nc, sub, nc->err, NULL);
 
         natsConn_Unlock(nc);
     }
@@ -2687,7 +2690,7 @@ _processPermissionViolation(natsConnection *nc, char *error)
     nc->err = NATS_NOT_PERMITTED;
     snprintf(nc->errStr, sizeof(nc->errStr), "%s", error);
     if (nc->opts->asyncErrCb != NULL)
-        natsAsyncCb_PostErrHandler(nc, NULL, NATS_NOT_PERMITTED);
+        natsAsyncCb_PostErrHandler(nc, NULL, nc->err, NATS_STRDUP(error));
     natsConn_Unlock(nc);
 }
 
@@ -2702,7 +2705,7 @@ _processAuthError(natsConnection *nc, int errCode, char *error)
     snprintf(nc->errStr, sizeof(nc->errStr), "%s", error);
 
     if (!nc->initc && nc->opts->asyncErrCb != NULL)
-        natsAsyncCb_PostErrHandler(nc, NULL, NATS_CONNECTION_AUTH_FAILED);
+        natsAsyncCb_PostErrHandler(nc, NULL, nc->err, NATS_STRDUP(error));
 
     if (nc->cur->lastAuthErrCode == errCode)
         nc->ar = true;
@@ -3014,13 +3017,6 @@ natsConn_unsubscribe(natsConnection *nc, natsSubscription *sub, int max, bool dr
 {
     natsStatus      s = NATS_OK;
 
-    if ((sub != NULL) && (sub->jsi != NULL))
-    {
-        s = jsSub_unsubscribe(sub->jsi, drainMode);
-        if (s != NATS_OK)
-            return NATS_UPDATE_ERR_STACK(s);
-    }
-
     natsConn_Lock(nc);
 
     if (natsConn_isClosed(nc))
@@ -3040,8 +3036,14 @@ natsConn_unsubscribe(natsConnection *nc, natsSubscription *sub, int max, bool dr
     }
 
     if (max > 0)
-        natsSub_setMax(sub, max);
-    else if (!drainMode)
+    {
+        // If we try to set a max but number of delivered messages
+        // is already higher than that, then we will do an actual
+        // remove.
+        if (!natsSub_setMax(sub, max))
+            max = 0;
+    }
+    if ((max == 0) && !drainMode)
         natsConn_removeSubscription(nc, sub);
 
     if (!drainMode && !natsConn_isReconnecting(nc))
@@ -3448,10 +3450,12 @@ static void
 _pushDrainErr(natsConnection *nc, natsStatus s, const char *errTxt)
 {
     natsConn_Lock(nc);
-    nc->err = s;
-    snprintf(nc->errStr, sizeof(nc->errStr), "Drain error: %s: %d (%s)", errTxt, s, natsStatus_GetText(s));
     if (nc->opts->asyncErrCb != NULL)
-        natsAsyncCb_PostErrHandler(nc, NULL, s);
+    {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "Drain error: %s: %d (%s)", errTxt, s, natsStatus_GetText(s));
+        natsAsyncCb_PostErrHandler(nc, NULL, s, NATS_STRDUP(tmp));
+    }
     natsConn_Unlock(nc);
 }
 

@@ -120,6 +120,8 @@ natsSubAndLdw_Unlock(natsSubscription *sub)
     natsMutex_Unlock(sub->mu);
 }
 
+// Runs under the subscription lock but will release it for a JS subscription
+// if the JS consumer needs to be deleted.
 static void
 _setDrainCompleteState(natsSubscription *sub)
 {
@@ -128,6 +130,20 @@ _setDrainCompleteState(natsSubscription *sub)
     // switched to "drain complete", swith the state.
     if (!natsSub_drainComplete(sub))
     {
+        // For JS subscription we may need to delete the JS consumer, but
+        // we want to do so here ONLY if there was really a drain started.
+        // So need to check on drain started state. Also, note that if
+        // jsSub_deleteConsumerAfterDrain is invoked, the lock may be
+        // released/reacquired in that function.
+        if ((sub->jsi != NULL) && natsSub_drainStarted(sub) && sub->jsi->dc)
+        {
+            jsSub_deleteConsumerAfterDrain(sub);
+            // Check drainCompete state again, since another thread may have
+            // beat us to it while lock was released.
+            if (natsSub_drainComplete(sub))
+                return;
+        }
+
         // If drain status is not already set (could be done in _flushAndDrain
         // if flush fails, or timeout occurs), set it here to report if the
         // connection or subscription has been closed prior to drain completion.
@@ -282,14 +298,18 @@ natsSub_deliverMsgs(void *arg)
     natsSub_release(sub);
 }
 
-void
+bool
 natsSub_setMax(natsSubscription *sub, uint64_t max)
 {
+    bool accepted = false;
+
     natsSub_Lock(sub);
     SUB_DLV_WORKER_LOCK(sub);
-    sub->max = max;
+    sub->max = (max <= sub->delivered ? 0 : max);
+    accepted = sub->max != 0;
     SUB_DLV_WORKER_UNLOCK(sub);
     natsSub_Unlock(sub);
+    return accepted;
 }
 
 natsStatus
@@ -324,6 +344,9 @@ natsSub_close(natsSubscription *sub, bool connectionClosed)
     {
         sub->closed = true;
         sub->connClosed = connectionClosed;
+
+        if ((sub->jsi != NULL) && (sub->jsi->hbTimer != NULL))
+            natsTimer_Stop(sub->jsi->hbTimer);
 
         if (sub->libDlvWorker != NULL)
         {
@@ -738,10 +761,7 @@ natsSub_nextMsg(natsMsg **nextMsg, natsSubscription *sub, int64_t timeout, bool 
                 removeSub = true;
         }
         if (removeSub)
-        {
-            _setDrainCompleteState(sub);
             _retain(sub);
-        }
     }
     if ((s == NATS_OK) && natsMsg_IsNoResponders(msg))
     {
@@ -761,6 +781,7 @@ natsSub_nextMsg(natsMsg **nextMsg, natsSubscription *sub, int64_t timeout, bool 
 
     if (removeSub)
     {
+        natsSub_setDrainCompleteState(sub);
         natsConn_removeSubscription(nc, sub);
         natsSub_release(sub);
     }
@@ -788,6 +809,8 @@ _unsubscribe(natsSubscription *sub, int max, bool drainMode, int64_t timeout)
 {
     natsStatus      s   = NATS_OK;
     natsConnection  *nc = NULL;
+    bool            dc  = false;
+    jsSub           *jsi;
 
     if (sub == NULL)
         return nats_setDefaultError(NATS_INVALID_ARG);
@@ -796,9 +819,23 @@ _unsubscribe(natsSubscription *sub, int max, bool drainMode, int64_t timeout)
     nc = sub->conn;
     _retain(sub);
 
+    if ((jsi = sub->jsi) != NULL)
+    {
+        if (jsi->hbTimer != NULL)
+            natsTimer_Stop(jsi->hbTimer);
+
+        dc = jsi->dc;
+    }
+
     natsSub_Unlock(sub);
 
     s = natsConn_unsubscribe(nc, sub, max, drainMode, timeout);
+
+    // If user calls natsSubscription_Unsubscribe() and this
+    // is a JS subscription that is supposed to delete the JS
+    // consumer, do so now.
+    if ((s == NATS_OK) && (max == 0) && !drainMode && dc)
+        s = jsSub_deleteConsumer(sub);
 
     natsSub_release(sub);
 
@@ -894,12 +931,14 @@ _flushAndDrain(void *closure)
     natsThread       *t       = NULL;
     int64_t          timeout  = 0;
     int64_t          deadline = 0;
+    bool             sync     = false;
     natsStatus       s;
 
     natsSub_Lock(sub);
     nc      = sub->conn;
     t       = sub->drainThread;
     timeout = sub->drainTimeout;
+    sync    = (sub->msgCb == NULL ? true : false);
     natsSub_Unlock(sub);
 
     // Make sure that negative value is considered no timeout.
@@ -931,8 +970,19 @@ _flushAndDrain(void *closure)
         s = NATS_OK;
         // Wait for drain to complete or deadline is reached.
         natsSub_Lock(sub);
-        while ((s != NATS_TIMEOUT) && !natsSub_drainComplete(sub))
-            s = natsCondition_AbsoluteTimedWait(sub->cond, sub->mu, deadline);
+        // For sync subs, it is possible that we get here and users have
+        // already called NextMsg() for all pending messages before the sub
+        // was marked as "draining", so if we detect this situation, we need
+        // to switch status to complete here.
+        if (sync && !natsSub_drainComplete(sub) && (sub->msgList.msgs == 0))
+        {
+            _setDrainCompleteState(sub);
+        }
+        else
+        {
+            while ((s != NATS_TIMEOUT) && !natsSub_drainComplete(sub))
+                s = natsCondition_AbsoluteTimedWait(sub->cond, sub->mu, deadline);
+        }
         natsSub_Unlock(sub);
 
         if (s != NATS_OK)
@@ -1011,6 +1061,7 @@ natsSubscription_WaitForDrainCompletion(natsSubscription *sub, int64_t timeout)
 {
     natsStatus  s        = NATS_OK;
     int64_t     deadline = 0;
+    bool        dc       = false;
 
     if (sub == NULL)
         return nats_setDefaultError(NATS_INVALID_ARG);
@@ -1023,6 +1074,8 @@ natsSubscription_WaitForDrainCompletion(natsSubscription *sub, int64_t timeout)
     }
     _retain(sub);
 
+    dc = (sub->jsi != NULL ? sub->jsi->dc : false);
+
     if (timeout > 0)
         deadline = nats_setTargetTime(timeout);
 
@@ -1034,6 +1087,9 @@ natsSubscription_WaitForDrainCompletion(natsSubscription *sub, int64_t timeout)
             natsCondition_Wait(sub->cond, sub->mu);
     }
     natsSub_Unlock(sub);
+
+    if ((s == NATS_OK) && dc)
+        s = jsSub_deleteConsumer(sub);
 
     natsSub_release(sub);
 
