@@ -552,24 +552,25 @@ natsOptions_SetCertificatesChain(natsOptions *opts, const char *certStr, const c
     }
     if (s == NATS_OK)
     {
-        RSA *rsa  = NULL;
-        BIO *bio  = NULL;
+        BIO         *bio  = NULL;
+        EVP_PKEY    *pkey = NULL;
 
         bio = BIO_new_mem_buf((char*) keyStr, -1);
-        if ((bio == NULL) || ((rsa = PEM_read_bio_RSAPrivateKey(bio, NULL, 0, NULL)) == NULL))
+        if ((bio == NULL) || ((pkey = PEM_read_bio_PrivateKey(bio, NULL, 0, NULL)) == NULL))
         {
             s = nats_setError(NATS_SSL_ERROR,
                               "Error creating key: %s",
                               NATS_SSL_ERR_REASON_STRING);
         }
-        if ((s == NATS_OK) && (SSL_CTX_use_RSAPrivateKey(opts->sslCtx->ctx, rsa) != 1))
+
+        if ((s == NATS_OK) && (SSL_CTX_use_PrivateKey(opts->sslCtx->ctx, pkey) != 1))
         {
             s = nats_setError(NATS_SSL_ERROR,
                               "Error using private key: %s",
                               NATS_SSL_ERR_REASON_STRING);
         }
-        if (rsa != NULL)
-            RSA_free(rsa);
+        if (pkey != NULL)
+            EVP_PKEY_free(pkey);
         if (bio != NULL)
             BIO_free(bio);
     }
@@ -1339,6 +1340,52 @@ natsOptions_DisableNoResponders(natsOptions *opts, bool disabled)
     return NATS_OK;
 }
 
+static natsStatus
+_setCustomInboxPrefix(natsOptions *opts, const char *inboxPrefix, bool check)
+{
+    natsStatus s = NATS_OK;
+
+    LOCK_AND_CHECK_OPTIONS(opts, 0);
+
+    NATS_FREE(opts->inboxPfx);
+    opts->inboxPfx = NULL;
+
+    if (!nats_IsStringEmpty(inboxPrefix))
+    {
+        // If not called from clone(), we need to check the validity of the
+        // inbox prefix.
+        if (check && !nats_IsSubjectValid(inboxPrefix, false))
+            s = nats_setError(NATS_INVALID_ARG, "Invalid inbox prefix '%s'", inboxPrefix);
+
+        if (s == NATS_OK)
+        {
+            // If invoked from user, there will not be the last '.', which
+            // we will add here.
+            if (check)
+            {
+                if (nats_asprintf(&opts->inboxPfx, "%s.", inboxPrefix) < 0)
+                    s = nats_setDefaultError(NATS_NO_MEMORY);
+            }
+            else
+            {
+                // We are invoked from clone(), simply duplicate the string.
+                DUP_STRING(s, opts->inboxPfx, inboxPrefix);
+            }
+        }
+    }
+
+    UNLOCK_OPTS(opts);
+
+    return s;
+}
+
+natsStatus
+natsOptions_SetCustomInboxPrefix(natsOptions *opts, const char *inboxPrefix)
+{
+    natsStatus s = _setCustomInboxPrefix(opts, inboxPrefix, true);
+    return NATS_UPDATE_ERR_STACK(s);
+}
+
 static void
 _freeOptions(natsOptions *opts)
 {
@@ -1354,6 +1401,7 @@ _freeOptions(natsOptions *opts)
     NATS_FREE(opts->nkey);
     natsSSLCtx_release(opts->sslCtx);
     _freeUserCreds(opts->userCreds);
+    NATS_FREE(opts->inboxPfx);
     natsMutex_Destroy(opts->mu);
     NATS_FREE(opts);
 }
@@ -1432,6 +1480,7 @@ natsOptions_clone(natsOptions *opts)
     cloned->token   = NULL;
     cloned->nkey    = NULL;
     cloned->userCreds = NULL;
+    cloned->inboxPfx  = NULL;
 
     // Also, set the number of servers count to 0, until we update
     // it (if necessary) when calling SetServers.
@@ -1470,6 +1519,8 @@ natsOptions_clone(natsOptions *opts)
                                                     opts->userCreds->userOrChainedFile,
                                                     opts->userCreds->seedFile);
     }
+    if ((s == NATS_OK) && (opts->inboxPfx != NULL))
+        s = _setCustomInboxPrefix(cloned, opts->inboxPfx, false);
 
     if (s != NATS_OK)
     {

@@ -53,6 +53,13 @@ extern const int64_t    jsDefaultRequestWait;
 #define jsErrNoHeartbeatForQueueSub         "a queue subscription cannot be created for a consumer with heartbeat"
 #define jsErrNoFlowControlForQueueSub       "a queue subscription cannot be created for a consumer with flow control"
 #define jsErrConsumerSeqMismatch            "consumer sequence mismatch"
+#define jsErrOrderedConsNoDurable           "durable can not be set for an ordered consumer"
+#define jsErrOrderedConsNoAckPolicy         "ack policy can not be set for an ordered consume"
+#define jsErrOrderedConsNoMaxDeliver        "max deliver can not be set for an ordered consumer"
+#define jsErrOrderedConsNoDeliverSubject    "deliver subject can not be set for an ordered consumer"
+#define jsErrOrderedConsNoQueue             "queue can not be set for an ordered consumer"
+#define jsErrOrderedConsNoBind              "can not bind existing consumer for an ordered consumer"
+#define jsErrOrderedConsNoPullMode          "can not use pull mode for an ordered consumer"
 
 #define jsCtrlHeartbeat     (1)
 #define jsCtrlFlowControl   (2)
@@ -81,6 +88,8 @@ extern const int64_t    jsDefaultRequestWait;
 #define jsReplayOriginalStr "original"
 #define jsReplayInstantStr  "instant"
 
+#define jsAckPrefix         "$JS.ACK."
+#define jsAckPrefixLen      (8)
 
 // Content of ACK messages sent to server
 #define jsAckAck            "+ACK"
@@ -123,6 +132,12 @@ extern const int64_t    jsDefaultRequestWait;
 
 // jsApiRequestNextT is the prefix for the request next message(s) for a consumer in worker/pull mode.
 #define jsApiRequestNextT "%s.CONSUMER.MSG.NEXT.%s.%s"
+
+// jsApiMsgDeleteT is the endpoint to remove a message.
+#define jsApiMsgDeleteT "%.*s.STREAM.MSG.DELETE.%s"
+
+// jsApiMsgGetT is the endpoint to get a message, either by sequence or last per subject.
+#define jsApiMsgGetT "%.*s.STREAM.MSG.GET.%s"
 
 // Creates a subject based on the option's prefix, the subject format and its values.
 #define js_apiSubj(s, o, f, ...) (nats_asprintf((s), (f), (o)->Prefix, __VA_ARGS__) < 0 ? NATS_NO_MEMORY : NATS_OK)
@@ -190,3 +205,24 @@ js_unmarshalConsumerInfo(nats_JSON *json, jsConsumerInfo **new_ci);
 
 void
 js_cleanStreamState(jsStreamState *state);
+
+natsStatus
+js_checkDurName(const char *dur);
+
+natsStatus
+js_getMetaData(const char *reply,
+    char **domain,
+    char **stream,
+    char **consumer,
+    uint64_t *numDelivered,
+    uint64_t *sseq,
+    uint64_t *dseq,
+    int64_t *tm,
+    uint64_t *numPending,
+    int asked);
+
+void
+js_retain(jsCtx *js);
+
+void
+js_release(jsCtx *js);

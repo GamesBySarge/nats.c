@@ -9,7 +9,7 @@ This NATS Client implementation is heavily based on the [NATS GO Client](https:/
 [![License Apache 2](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Build Status](https://travis-ci.com/nats-io/nats.c.svg?branch=main)](https://travis-ci.com/github/nats-io/nats.c)
 [![Coverage Status](https://coveralls.io/repos/github/nats-io/nats.c/badge.svg?branch=main)](https://coveralls.io/github/nats-io/nats.c?branch=main)
-[![Release](https://img.shields.io/badge/release-v3.1.1-blue.svg?style=flat)](https://github.com/nats-io/nats.c/releases/tag/v3.1.1)
+[![Release](https://img.shields.io/badge/release-v3.2.0-blue.svg?style=flat)](https://github.com/nats-io/nats.c/releases/tag/v3.2.0)
 [![Documentation](https://img.shields.io/badge/doc-Doxygen-brightgreen.svg?style=flat)](http://nats-io.github.io/nats.c)
 [![Total alerts](https://img.shields.io/lgtm/alerts/g/nats-io/nats.c.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/nats-io/nats.c/alerts/)
 [![Language grade: C/C++](https://img.shields.io/lgtm/grade/cpp/g/nats-io/nats.c.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/nats-io/nats.c/context:cpp)
@@ -18,6 +18,7 @@ This NATS Client implementation is heavily based on the [NATS GO Client](https:/
 
 - [Building](#building)
 	* [TLS Support](#tls-support)
+        * [Link statically](#link-statically)
     * [Building with Streaming](#building-with-streaming)
     * [Building with Libsodium](#building-with-libsodium)
     * [Testing](#testing)
@@ -27,6 +28,9 @@ This NATS Client implementation is heavily based on the [NATS GO Client](https:/
     * [JetStream](#jetstream)
         * [JetStream Basic Usage](#jetstream-basic-usage)
         * [JetStream Basic Management](#jetstream-basic-usage)
+    * [KeyValue](#keyvalue)
+        * [KeyValue Management](#keyvalue-management)
+        * [KeyValue APIs](#keyvalue-apis)
 	* [Getting Started](#getting-started)
 	* [Basic Usage](#basic-usage)
     * [Headers](#headers)
@@ -154,6 +158,15 @@ cmake .. -DNATS_BUILD_TLS_USE_OPENSSL_1_1_API=ON
 Since the NATS C client dynamically links to the OpenSSL library, you need to make sure that you are then running your application against an OpenSSL 1.1+ library.
 
 Note that the option `NATS_BUILD_WITH_TLS_CLIENT_METHOD` is deprecated. Its purpose was to make the NATS C client use a method that was introduced in OpenSSL `1.1+`. The new option `NATS_BUILD_TLS_USE_OPENSSL_1_1_API` is more generic and replaces `NATS_BUILD_WITH_TLS_CLIENT_METHOD`. If you are using scripts to automate your build process that makes use of `NATS_BUILD_WITH_TLS_CLIENT_METHOD`, they will still work and using this deprecated option will have the same effect than setting `NATS_BUILD_TLS_USE_OPENSSL_1_1_API` to `ON`.
+
+### Link statically
+
+If you want to link to the static OpenSSL library, you need to delete the `CMakeCache.txt` and regenerate it with the additional option:
+```
+rm CMakeCache.txt
+cmake .. <build options that you may already use> -DNATS_BUILD_OPENSSL_STATIC_LIBS=ON
+```
+Then call `make` (or equivalent depending on your platform) and this should ensure that the library (and examples and/or test suite executable) are linked against the OpenSSL library, if it was found by CMake.
 
 ## Building with Streaming
 
@@ -438,30 +451,31 @@ The new objects and APIs are full documented in the online [documentation](http:
 natsConnection_Connect(&conn, opts);
 
 // Initialize and set some JetStream options
-natsJSOptions_Init(&jsOpts);
-jsOpts.PublishAsyncMaxPending = 256;
+jsOptions jsOpts;
+jsOptions_Init(&jsOpts);
+jsOpts.PublishAsync.MaxPending = 256;
 
 // Create JetStream Context
-natsJS_NewContext(&js, conn, &jsOpts);
+natsConnection_JetStream(&js, conn, &jsOpts);
 
 // Simple Stream Publisher
-natsJS_Publish(&pa, js, "ORDERS.scratch", (const void*) "hello", 5, NULL, &jerr);
+js_Publish(&pa, js, "ORDERS.scratch", (const void*) "hello", 5, NULL, &jerr);
 
 // Simple Async Stream Publisher
 for (i=0; i < 500; i++)
 {
-    natsJS_PublishAsync(js, "ORDERS.scratch", (const void*) "hello", 5, NULL);
+    js_PublishAsync(js, "ORDERS.scratch", (const void*) "hello", 5, NULL);
 }
 
 // Wait for up to 5 seconds to receive all publish acknowledgments.
-natsJSPubOptions_Init(&jsPubOpts);
+jsPubOptions_Init(&jsPubOpts);
 jsPubOpts.MaxWait = 5000;
-natsJS_PublishAsyncComplete(js, &jsPubOpts);
+js_PublishAsyncComplete(js, &jsPubOpts);
 
 // One can get the list of all pending publish async messages,
 // to either resend them or simply destroy them.
 natsMsgList pending;
-s = js_PublishAsyncGetPending(&pending, js);
+s = js_PublishAsyncGetPendingList(&pending, js);
 if (s == NATS_OK)
 {
     int i;
@@ -485,52 +499,257 @@ if (s == NATS_OK)
 }
 
 // To create an asynchronous ephemeral consumer
-js_Subscribe(&sub, js, "foo", myMsgHandler, myClosure, &jsOpts, NULL);
+js_Subscribe(&sub, js, "foo", myMsgHandler, myClosure, &jsOpts, NULL, &jerr);
 
 // Same but use a subscription option to ask the callback to not do auto-ack.
 jsSubOptions so;
 jsSubOptions_Init(&so);
 so.ManualAck = true;
-js_Subscribe(&sub, js, "foo", myMsgHandler, myClosure, &jsOpts, &so);
+js_Subscribe(&sub, js, "foo", myMsgHandler, myClosure, &jsOpts, &so, &jerr);
 
 // Or to bind to an existing specific stream/durable:
 jsSubOptions_Init(&so);
 so.Stream = "MY_STREAM";
 so.Consumer = "my_durable";
-js_Subscribe(&sub, js, "foo", myMsgHandler, myClosure, &jsOpts, &so);
+js_Subscribe(&sub, js, "foo", myMsgHandler, myClosure, &jsOpts, &so, &jerr);
 
 // Synchronous subscription:
-js_SubscribeSync(&sub, js, "foo", &jsOpts, &so);
+js_SubscribeSync(&sub, js, "foo", &jsOpts, &so, &jerr);
 ```
 
 ### JetStream Basic Management
 
 ```c
-natsJSStreamConfig  cfg;
+jsStreamConfig  cfg;
 
 // Connect to NATS
 natsConnection_Connect(&conn, opts);
 
 // Create JetStream Context
-natsJS_NewContext(&js, conn, NULL);
+natsConnection_JetStream(&js, conn, NULL);
 
 // Initialize the configuration structure.
-natsJSStreamConfig_Init(&cfg);
+jsStreamConfig_Init(&cfg);
 // Provide a name
 cfg.Name = "ORDERS";
 // Array of subjects and its size
 cfg.Subjects = (const char*[1]){"ORDERS.*"};
 cfg.SubjectsLen = 1;
 
-// Create a Stream
-natsJS_AddStream(NULL, js, &cfg, NULL, &jerr);
+// Create a Stream. If you are not interested in the returned jsStreamInfo object,
+// you can pass NULL.
+js_AddStream(NULL, js, &cfg, NULL, &jerr);
 
 // Update a Stream
 cfg.MaxBytes = 8;
-natsJS_UpdateStream(NULL, js, &cfg, NULL, &jerr);
+js_UpdateStream(NULL, js, &cfg, NULL, &jerr);
 
 // Delete a Stream
-natsJS_DeleteStream(js, "ORDERS", NULL, &jerr);
+js_DeleteStream(js, "ORDERS", NULL, &jerr);
+```
+
+## KeyValue
+
+**EXPERIMENTAL FEATURE! We reserve the right to change the API without necessarily bumping the major version of the library.**
+
+A KeyValue store is a materialized view based on JetStream. A bucket is a stream and keys are subjects within that stream.
+
+Some features require NATS Server `v2.6.2`, so we recommend that you use the latest NATS Server release to have a better experience.
+
+The new objects and APIs are full documented in the online [documentation](http://nats-io.github.io/nats.c/group__kv_group.html).
+
+### KeyValue Management
+
+Example of how to create a KeyValue store:
+```c
+jsCtx       *js = NULL;
+kvStore     *kv = NULL;
+kvConfig    kvc;
+
+// Assume we got a JetStream context in `js`...
+
+kvConfig_Init(&kvc);
+kvc.Bucket = "KVS";
+kvc.History = 10;
+s = js_CreateKeyValue(&kv, js, &kvc);
+
+// Do some stuff...
+
+// This is to free the memory used by `kv` object,
+// not delete the KeyValue store in the server
+kvStore_Destroy(kv);
+```
+
+This shows how to "bind" to an existing one:
+```c
+jsCtx       *js = NULL;
+kvStore     *kv = NULL;
+
+// Assume we got a JetStream context in `js`...
+
+s = js_KeyValue(&kv, ks, "KVS");
+
+// Do some stuff...
+
+// This is to free the memory used by `kv` object,
+// not delete the KeyValue store in the server
+kvStore_Destroy(kv);
+```
+
+This is how to delete a KeyValue store in the server:
+```c
+jsCtx       *js = NULL;
+
+// Assume we got a JetStream context in `js`...
+
+s = js_DeleteKeyValue(js, "KVS");
+```
+
+### KeyValue APIs
+
+This is how to put a value for a given key:
+```c
+kvStore     *kv = NULL;
+uint64_t    rev = 0;
+
+// Assume we got a kvStore...
+
+s = kvStore_PutString(&rev, kv, "MY_KEY", "my value");
+
+// If the one does not care about getting the revision, pass NULL:
+s = kvStore_PutString(NULL, kv, "MY_KEY", "my value");
+```
+
+The above places a value for a given key, but if instead one wants to make sure that the value is placed for the key only if it never existed before, one would call:
+```c
+// Same note than before: if "rev" is not needed, pass NULL:
+s = kvStore_CreateString(&rev, kv, "MY_KEY", "my value");
+```
+
+One can update a key if and only if the last revision in the server matches the one passed to this API:
+```c
+// This would update the key "MY_KEY" with the value "my updated value" only if the current revision (sequence number) for this key is 10.
+s = kvStore_UpdateString(&rev, kv, "MY_KEY", "my updated value", 10);
+```
+
+This is how to get a key:
+```c
+kvStore *kv = NULL;
+kvEntry *e  = NULL;
+
+// Assume we got a kvStore...
+
+s = kvStore_Get(&e, kv, "MY_KEY");
+
+// Then we can get some fields from the entry:
+printf("Key value: %s\n", kvEntry_ValueString(e));
+
+// Once done with the entry, we need to destroy it to release memory.
+// This is NOT deleting the key from the server.
+kvEntry_Destroy(e);
+```
+
+This is how to purge a key:
+```c
+kvStore *kv = NULL;
+
+// Assume we got a kvStore...
+
+s = kvStore_Purge(kv, "MY_KEY");
+```
+
+This will delete the key in the server:
+```c
+kvStore *kv = NULL;
+
+// Assume we got a kvStore...
+
+s = kvStore_Delete(kv, "MY_KEY");
+```
+
+To create a "watcher" for a given key:
+```c
+kvWatcher       *w = NULL;
+kvWatchOptions  o;
+
+// Assume we got a kvStore...
+
+// Say that we are not interested in getting the
+// delete markers...
+
+// Initialize a kvWatchOptions object:
+kvWatchOptions_Init(&o);
+o.IgnoreDeletes = true;
+// Create the watcher
+s = kvStore_Watch(&w, kv, "foo.*", &o);
+// Check for error..
+
+// Now get updates:
+while (some_condition)
+{
+    kvEntry *e = NULL;
+
+    // Wait for the next update for up to 5 seconds
+    s = kvWatcher_Next(&e, w, 5000);
+
+    // Do something with the entry...
+
+    // Destroy to release memory
+    kvEntry_Destroy(e);
+}
+
+// When done with the watcher, it needs to be destroyed to release memory:
+kvWatcher_Destroy(w);
+```
+
+To get the history of a key:
+```c
+kvEntryList l;
+int         i;
+
+// The list is defined on the stack and will be initilized/updated by this call:
+s = kvStore_History(&l, kv, "MY_KEY", NULL);
+
+for (i=0; i<l.Count; i++)
+{
+    kvEntry *e = l.Entries[i];
+
+    // Do something with the entry...
+}
+// When done with the list, call this to free entries and the content of the list.
+kvEntryList_Destroy(&l);
+
+// In order to set a timeout to get the history, we need to do so through options:
+kvWatchOptions o;
+
+kvWatchOptions_Init(&o);
+o.Timeout = 5000; // 5 seconds.
+s = kvStore_History(&l, kv, "MY_KEY", &o);
+```
+
+This is how you would get the keys of a bucket:
+```c
+kvKeysList  l;
+int         i;
+
+// If no option is required, pass NULL as the last argument.
+s = kvStore_Keys(&l, kv, NULL);
+// Check error..
+
+// Go over all keys:
+for (i=0; i<l.Count; i++)
+    printf("Key: %s\n", l.Keys[i]);
+
+// When done, list need to be destroyed.
+kvKeysList_Destroy(&l);
+
+// If option need to be specified:
+
+kvWatchOptions o;
+
+kvWatchOptions_Init(&o);
+o.Timeout = 5000; // 5 seconds.
+s = kvStore_Keys(&l, kv, &o);
 ```
 
 ## Headers

@@ -1,4 +1,4 @@
-// Copyright 2015-2021 The NATS Authors
+// Copyright 2015-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -70,7 +70,7 @@
 
 #define _PING_PROTO_         "PING\r\n"
 #define _PONG_PROTO_         "PONG\r\n"
-#define _SUB_PROTO_          "SUB %s %s %d\r\n"
+#define _SUB_PROTO_          "SUB %s %s %" PRId64 "\r\n"
 #define _UNSUB_PROTO_        "UNSUB %" PRId64 " %d\r\n"
 #define _UNSUB_NO_MAX_PROTO_ "UNSUB %" PRId64 " \r\n"
 
@@ -89,18 +89,14 @@
 #define _OK_OP_LEN_         (3)
 #define _ERR_OP_LEN_        (4)
 
-#define NATS_INBOX_PRE_LEN  (7)
+#define NATS_DEFAULT_INBOX_PRE      "_INBOX."
+#define NATS_DEFAULT_INBOX_PRE_LEN  (7)
 
-#define NATS_REQ_ID_OFFSET  (NATS_INBOX_PRE_LEN + NUID_BUFFER_LEN + 1)
 #define NATS_MAX_REQ_ID_LEN (19) // to display 2^63-1 number
-
-#define NATS_INBOX_ARRAY_SIZE   (NATS_INBOX_PRE_LEN + NUID_BUFFER_LEN + 1)
 
 #define WAIT_FOR_READ       (0)
 #define WAIT_FOR_WRITE      (1)
 #define WAIT_FOR_CONNECT    (2)
-
-#define DEFAULT_PORT_STRING "4222"
 
 #define DEFAULT_DRAIN_TIMEOUT   30000 // 30 seconds
 
@@ -134,6 +130,9 @@
 #endif
 
 #define IFOK(s, c)      if (s == NATS_OK) { s = (c); }
+
+#define NATS_MILLIS_TO_NANOS(d)     (((int64_t)d)*(int64_t)1E6)
+#define NATS_SECONDS_TO_NANOS(d)    (((int64_t)d)*(int64_t)1E9)
 
 extern int64_t gLockSpinCount;
 
@@ -306,6 +305,9 @@ struct __natsOptions
 
     // Disable the "no responders" feature.
     bool disableNoResponders;
+
+    // Custom inbox prefix
+    char *inboxPfx;
 };
 
 typedef struct __nats_MsgList
@@ -337,6 +339,7 @@ struct __jsCtx
     natsStrHash         *pm;
     natsSubscription    *rsub;
     char                *rpre;
+    int                 rpreLen;
     int                 pacw;
     int64_t             pmcount;
     int                 stalled;
@@ -349,7 +352,17 @@ typedef struct __jsSub
     char                *consumer;
     char                *nxtMsgSubj;
     bool                pull;
+    bool                ordered;
     bool                dc; // delete JS consumer in Unsub()/Drain()
+    bool                ackNone;
+
+    // This is ConsumerInfo's Pending+Consumer.Delivered that we get from the
+    // add consumer response. Note that some versions of the server gather the
+    // consumer info *after* the creation of the consumer, which means that
+    // some messages may have been already delivered. So the sum of the two
+    // is a more accurate representation of the number of messages pending or
+    // in the process of being delivered to the subscription when created.
+    uint64_t            pending;
 
     int64_t             hbi;
     int64_t             active;
@@ -381,9 +394,58 @@ typedef struct __jsSub
     // For flow control, when the subscription reaches this
     // delivered count, then send a message to this reply subject.
     uint64_t            fcDelivered;
+    uint64_t            fciseq;
     char                *fcReply;
 
+    // When reseting an OrderedConsumer, need the original filter subject.
+    char                *fsubj;
+
 } jsSub;
+
+struct __kvStore
+{
+    natsMutex           *mu;
+    int                 refs;
+    jsCtx               *js;
+    char                *bucket;
+    char                *stream;
+    char                *pre;
+    bool                useJSPrefix;
+
+};
+
+struct __kvEntry
+{
+    kvStore             *kv;
+    const char          *key;
+    natsMsg             *msg;
+    uint64_t            delta;
+    kvOperation         op;
+    struct __kvEntry    *next;
+
+};
+
+struct __kvStatus
+{
+    kvStore             *kv;
+    jsStreamInfo        *si;
+
+};
+
+struct __kvWatcher
+{
+    natsMutex           *mu;
+    int                 refs;
+    kvStore             *kv;
+    natsSubscription    *sub;
+    uint64_t            initPending;
+    uint64_t            received;
+    bool                ignoreDel;
+    bool                initDone;
+    bool                retMarker;
+    bool                stopped;
+
+};
 
 struct __natsSubscription
 {
@@ -538,6 +600,9 @@ typedef struct __respInfo
 
 } respInfo;
 
+// Used internally for testing and allow to alter/suppress an incoming message
+typedef void (*natsMsgFilter)(natsConnection *nc, natsMsg **msg, void* closure);
+
 struct __natsConnection
 {
     natsMutex           *mu;
@@ -608,6 +673,12 @@ struct __natsConnection
     int                 respPoolSize;
     int                 respPoolIdx;
 
+    // For inboxes. We now support custom prefixes, so we can't rely
+    // on constants based on hardcoded "_INBOX." prefix.
+    const char          *inboxPfx;
+    int                 inboxPfxLen;
+    int                 reqIdOffset;
+
     struct
     {
         bool            attached;
@@ -615,6 +686,19 @@ struct __natsConnection
         void            *buffer;
         void            *data;
     } el;
+
+    // Msg filters for testing.
+    // Protected by subsMu
+    natsMsgFilter       filter;
+    void                *filterClosure;
+
+    // Server version
+    struct
+    {
+        int             ma;
+        int             mi;
+        int             up;
+    } srvVersion;
 };
 
 //
@@ -657,9 +741,6 @@ nats_sslRegisterThreadForCleanup(void);
 
 natsStatus
 nats_sslInit(void);
-
-natsStatus
-natsInbox_init(char *inbox, int inboxLen);
 
 natsStatus
 natsLib_msgDeliveryPostControlMsg(natsSubscription *sub);
@@ -779,10 +860,19 @@ natsStatus
 jsSub_trackSequences(jsSub *jsi, const char *reply);
 
 natsStatus
-jsSub_processSequenceMismatch(natsSubscription *sub, natsMsg *msg, bool *sm);
+jsSub_processSequenceMismatch(natsSubscription *sub, natsMutex *mu, natsMsg *msg, bool *sm);
+
+char*
+jsSub_checkForFlowControlResponse(natsSubscription *sub);
 
 natsStatus
-jsSub_scheduleFlowControlResponse(jsSub *jsi, natsSubscription *sub, const char *reply);
+jsSub_scheduleFlowControlResponse(jsSub *jsi, const char *reply);
+
+natsStatus
+jsSub_checkOrderedMsg(natsSubscription *sub, natsMutex *mu, natsMsg *msg, bool *reset);
+
+natsStatus
+jsSub_resetOrderedConsumer(natsSubscription *sub, natsMutex *mu, uint64_t sseq);
 
 bool
 natsMsg_isJSCtrl(natsMsg *msg, int *ctrlType);

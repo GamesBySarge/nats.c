@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 
 #include "conn.h"
 #include "mem.h"
@@ -492,6 +493,31 @@ _readOp(natsConnection *nc, natsControl *control)
     return NATS_UPDATE_ERR_STACK(s);
 }
 
+static void
+_unpackSrvVersion(natsConnection *nc)
+{
+    nc->srvVersion.ma  = 0;
+    nc->srvVersion.mi = 0;
+    nc->srvVersion.up  = 0;
+
+    if (nats_IsStringEmpty(nc->info.version))
+        return;
+
+    sscanf(nc->info.version, "%d.%d.%d", &(nc->srvVersion.ma), &(nc->srvVersion.mi), &(nc->srvVersion.up));
+}
+
+bool
+natsConn_srvVersionAtLeast(natsConnection *nc, int major, int minor, int update)
+{
+    bool ok;
+    natsConn_Lock(nc);
+    ok = (((nc->srvVersion.ma > major)
+            || ((nc->srvVersion.ma == major) && (nc->srvVersion.mi > minor))
+            || ((nc->srvVersion.ma == major) && (nc->srvVersion.mi == minor) && (nc->srvVersion.up >= update))) ? true : false);
+    natsConn_Unlock(nc);
+    return ok;
+}
+
 // _processInfo is used to parse the info messages sent
 // from the server.
 // This function may update the server pool.
@@ -526,6 +552,9 @@ _processInfo(natsConnection *nc, char *info, int len)
     IFOK(s, nats_JSONGetStr(json, "client_ip", &(nc->info.clientIP)));
     IFOK(s, nats_JSONGetBool(json, "ldm", &(nc->info.lameDuckMode)));
     IFOK(s, nats_JSONGetBool(json, "headers", &(nc->info.headers)));
+
+    if (s == NATS_OK)
+        _unpackSrvVersion(nc);
 
     // The array could be empty/not present on initial connect,
     // if advertise is disabled on that server, or servers that
@@ -1000,8 +1029,8 @@ _connectProto(natsConnection *nc, char **proto)
     return s;
 }
 
-static natsStatus
-_sendUnsubProto(natsConnection *nc, int64_t subId, int max)
+natsStatus
+natsConn_sendUnsubProto(natsConnection *nc, int64_t subId, int max)
 {
     natsStatus  s       = NATS_OK;
     char        *proto  = NULL;
@@ -1023,14 +1052,31 @@ _sendUnsubProto(natsConnection *nc, int64_t subId, int max)
     return NATS_UPDATE_ERR_STACK(s);
 }
 
+natsStatus
+natsConn_sendSubProto(natsConnection *nc, const char *subject, const char *queue, int64_t sid)
+{
+    natsStatus  s       = NATS_OK;
+    char        *proto  = NULL;
+    int         res     = 0;
+
+    res = nats_asprintf(&proto, _SUB_PROTO_, subject, (queue == NULL ? "" : queue), sid);
+    if (res < 0)
+        s = nats_setDefaultError(NATS_NO_MEMORY);
+    else
+    {
+        s = natsConn_bufferWriteString(nc, proto);
+        NATS_FREE(proto);
+        proto = NULL;
+    }
+    return NATS_UPDATE_ERR_STACK(s);
+}
+
 static natsStatus
 _resendSubscriptions(natsConnection *nc)
 {
     natsStatus          s    = NATS_OK;
     natsSubscription    *sub = NULL;
     natsHashIter        iter;
-    char                *proto;
-    int                 res;
     int                 adjustedMax;
     natsSubscription    **subs = NULL;
     int                 i = 0;
@@ -1066,8 +1112,6 @@ _resendSubscriptions(natsConnection *nc)
     {
         sub = subs[i];
 
-        proto = NULL;
-
         adjustedMax = 0;
         natsSub_Lock(sub);
         if (natsSub_drainStarted(sub))
@@ -1085,27 +1129,14 @@ _resendSubscriptions(natsConnection *nc)
             if (adjustedMax == 0)
             {
                 natsSub_Unlock(sub);
-                s = _sendUnsubProto(nc, sub->sid, 0);
+                s = natsConn_sendUnsubProto(nc, sub->sid, 0);
                 continue;
             }
         }
 
-        res = nats_asprintf(&proto, _SUB_PROTO_,
-                            sub->subject,
-                            (sub->queue == NULL ? "" : sub->queue),
-                            (int) sub->sid);
-        if (res < 0)
-            s = NATS_NO_MEMORY;
-
-        if (s == NATS_OK)
-        {
-            s = natsConn_bufferWriteString(nc, proto);
-            NATS_FREE(proto);
-            proto = NULL;
-        }
-
+        s = natsConn_sendSubProto(nc, sub->subject, sub->queue, sub->sid);
         if ((s == NATS_OK) && (adjustedMax > 0))
-            s = _sendUnsubProto(nc, sub->sid, adjustedMax);
+            s = natsConn_sendUnsubProto(nc, sub->sid, adjustedMax);
 
         // Hold the lock up to that point so we are sure not to resend
         // any SUB/UNSUB for a subscription that is in draining mode.
@@ -1274,9 +1305,9 @@ natsConn_addRespInfo(respInfo **newResp, natsConnection *nc, char *respInbox, in
         nc->respId[nc->respIdPos + 1] = '\0';
 
         // Build the response inbox
-        memcpy(respInbox, nc->respSub, NATS_REQ_ID_OFFSET);
-        respInbox[NATS_REQ_ID_OFFSET-1] = '.';
-        memcpy(respInbox+NATS_REQ_ID_OFFSET, nc->respId, nc->respIdPos + 2); // copy the '\0' of respId
+        memcpy(respInbox, nc->respSub, nc->reqIdOffset);
+        respInbox[nc->reqIdOffset-1] = '.';
+        memcpy(respInbox+nc->reqIdOffset, nc->respId, nc->respIdPos + 2); // copy the '\0' of respId
 
         nc->respIdVal++;
         if (nc->respIdVal == 10)
@@ -1319,7 +1350,7 @@ natsConn_addRespInfo(respInfo **newResp, natsConnection *nc, char *respInbox, in
                 nc->respIdPos = 0;
         }
 
-        s = natsStrHash_Set(nc->respMap, respInbox+NATS_REQ_ID_OFFSET, true,
+        s = natsStrHash_Set(nc->respMap, respInbox+nc->reqIdOffset, true,
                             (void*) resp, NULL);
     }
 
@@ -1331,13 +1362,58 @@ natsConn_addRespInfo(respInfo **newResp, natsConnection *nc, char *respInbox, in
     return NATS_UPDATE_ERR_STACK(s);
 }
 
+natsStatus
+natsConn_initInbox(natsConnection *nc, char *buf, int bufSize, char **newInbox, bool *allocated)
+{
+    int         needed  = nc->inboxPfxLen+NUID_BUFFER_LEN+1;
+    char        *inbox  = buf;
+    bool        created = false;
+    natsStatus  s;
+
+    if (needed > bufSize)
+    {
+        inbox = NATS_MALLOC(needed);
+        if (inbox == NULL)
+            return nats_setDefaultError(NATS_NO_MEMORY);
+        created = true;
+    }
+    memcpy(inbox, nc->inboxPfx, nc->inboxPfxLen);
+    // This will add the terminal '\0';
+    s = natsNUID_Next(inbox+nc->inboxPfxLen, NUID_BUFFER_LEN+1);
+    if (s == NATS_OK)
+    {
+        *newInbox = inbox;
+        if (allocated != NULL)
+            *allocated = created;
+    }
+    else if (created)
+        NATS_FREE(inbox);
+
+    return s;
+}
+
+natsStatus
+natsConn_newInbox(natsConnection *nc, natsInbox **newInbox)
+{
+    natsStatus  s;
+    int         inboxLen = nc->inboxPfxLen+NUID_BUFFER_LEN+1;
+    char        *inbox   = NATS_MALLOC(inboxLen);
+
+    if (inbox == NULL)
+        return nats_setDefaultError(NATS_NO_MEMORY);
+
+    s = natsConn_initInbox(nc, inbox, inboxLen, (char**) newInbox, NULL);
+    if (s != NATS_OK)
+        NATS_FREE(inbox);
+    return s;
+}
+
 // Initialize some of the connection's fields used for request/reply mapping.
 // Connection's lock is held on entry.
 natsStatus
 natsConn_initResp(natsConnection *nc, natsMsgHandler cb)
 {
     natsStatus s = NATS_OK;
-    char       ginbox[NATS_INBOX_ARRAY_SIZE + 1 + 1]; // _INBOX.<nuid>.*
 
     nc->respPool = NATS_CALLOC(RESP_INFO_POOL_MAX_SIZE, sizeof(respInfo*));
     if (nc->respPool == NULL)
@@ -1345,11 +1421,17 @@ natsConn_initResp(natsConnection *nc, natsMsgHandler cb)
     if (s == NATS_OK)
         s = natsStrHash_Create(&nc->respMap, 4);
     if (s == NATS_OK)
-        s = natsInbox_Create(&nc->respSub);
+        s = natsConn_newInbox(nc, (natsInbox**) &nc->respSub);
     if (s == NATS_OK)
     {
-        snprintf(ginbox, sizeof(ginbox), "%s.*", nc->respSub);
-        s = natsConn_subscribeNoPoolNoLock(&(nc->respMux), nc, ginbox, cb, (void*) nc);
+        char *inbox = NULL;
+
+        if (nats_asprintf(&inbox, "%s.*", nc->respSub) < 0)
+            s = nats_setDefaultError(NATS_NO_MEMORY);
+        else
+            s = natsConn_subscribeNoPoolNoLock(&(nc->respMux), nc, inbox, cb, (void*) nc);
+
+        NATS_FREE(inbox);
     }
     if (s != NATS_OK)
     {
@@ -1943,8 +2025,7 @@ _connect(natsConnection *nc)
             {
                 if (natsConn_isClosed(nc))
                 {
-                    if (s == NATS_OK)
-                        s = NATS_CONNECTION_CLOSED;
+                    s = NATS_CONNECTION_CLOSED;
                     break;
                 }
 
@@ -2520,6 +2601,8 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
     bool             ctrlMsg = false;
     const char       *fcReply= NULL;
     int              jct     = 0;
+    natsMsgFilter    mf      = NULL;
+    void             *mfc    = NULL;
 
     natsMutex_Lock(nc->subsMu);
 
@@ -2527,7 +2610,11 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
     nc->stats.inBytes += (uint64_t) bufLen;
 
     sub = natsHash_Get(nc->subs, nc->ps->ma.sid);
-
+    if (sub != NULL)
+    {
+        mf  = nc->filter;
+        mfc = nc->filterClosure;
+    }
     natsMutex_Unlock(nc->subsMu);
 
     if (sub == NULL)
@@ -2543,6 +2630,13 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
     // to capture the real message payload data length, which has been
     // computed as the bufLen - header size.
     dl = msg->dataLen;
+
+    if (mf != NULL)
+    {
+        (*mf)(nc, &msg, mfc);
+        if (msg == NULL)
+            return NATS_OK;
+    }
 
     // Pick mutex, condition variable and list based on if the sub is
     // part of a global delivery thread pool or not.
@@ -2581,6 +2675,18 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
             // We will send it at the end of this function.
             natsMsgHeader_Get(msg, jsConsumerStalledHdr, &fcReply);
         }
+        else if (!ctrlMsg && jsi->ordered)
+        {
+            bool replaced = false;
+
+            s = jsSub_checkOrderedMsg(sub, mu, msg, &replaced);
+            if ((s != NATS_OK) || replaced)
+            {
+                natsMutex_Unlock(mu);
+                natsMsg_Destroy(msg);
+                return s;
+            }
+        }
     }
 
     if (!ctrlMsg)
@@ -2605,6 +2711,9 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
         else
         {
             bool signal= false;
+
+            if ((jsi != NULL) && jsi->ackNone)
+                natsMsg_setAcked(msg);
 
             if (sub->msgList.msgs > sub->msgsMax)
                 sub->msgsMax = sub->msgList.msgs;
@@ -2638,17 +2747,20 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
     else if ((jct == jsCtrlHeartbeat) && (msg->reply == NULL))
     {
         // Handle control heartbeat messages.
-        s = jsSub_processSequenceMismatch(sub, msg, &sm);
+        s = jsSub_processSequenceMismatch(sub, mu, msg, &sm);
     }
     else if ((jct == jsCtrlFlowControl) && (msg->reply != NULL))
     {
-        // If we have no pending, go ahead and send in place.
-        if (sub->msgList.msgs == 0)
+        // We will schedule the send of the FC reply once we have delivered the
+		// DATA message that was received before this flow control message, which
+		// has sequence `jsi.fciseq`. However, it is possible that this message
+		// has already been delivered, in that case, we need to send the FC reply now.
+        if (sub->delivered >= jsi->fciseq)
             fcReply = msg->reply;
         else
         {
             // Schedule a reply after the previous message is delivered.
-            s = jsSub_scheduleFlowControlResponse(jsi, sub, msg->reply);
+            s = jsSub_scheduleFlowControlResponse(jsi, msg->reply);
         }
     }
 
@@ -2846,41 +2958,21 @@ natsConn_removeSubscription(natsConnection *nc, natsSubscription *removedSub)
 }
 
 static bool
-_checkSubjOrQueue(const char *name, bool checkToken)
+_isQueueNameValid(const char *name)
 {
-    int     i       = 0;
-    int     len     = 0;
-    int     lastDot = -1;
-    char    c;
+    int i;
+    int len;
+
+    if (nats_IsStringEmpty(name))
+        return false;
 
     len = (int) strlen(name);
     for (i=0; i<len ; i++)
     {
-        c = name[i];
-        if ((c == ' ') || (c == '\t') || (c == '\r') || (c == '\n'))
-            return true;
-
-        if (checkToken && (c == '.'))
-        {
-            if ((i == len-1) || (i == lastDot+1))
-                return true;
-
-            lastDot = i;
-        }
+        if (isspace(name[i]))
+            return false;
     }
-    return false;
-}
-
-static bool
-_badSubject(const char *subj)
-{
-    return _checkSubjOrQueue(subj, true);
-}
-
-static bool
-_badQueue(const char *queue)
-{
-    return _checkSubjOrQueue(queue, false);
+    return true;
 }
 
 // subscribe is the internal subscribe function that indicates interest in a subject.
@@ -2896,10 +2988,10 @@ natsConn_subscribeImpl(natsSubscription **newSub,
     if (nc == NULL)
         return nats_setDefaultError(NATS_INVALID_ARG);
 
-    if ((subj == NULL) || (strlen(subj) == 0) || _badSubject(subj))
+    if (!nats_IsSubjectValid(subj, true))
         return nats_setDefaultError(NATS_INVALID_SUBJECT);
 
-    if ((queue != NULL) && ((strlen(subj) == 0) || _badQueue(queue)))
+    if ((queue != NULL) && !_isQueueNameValid(queue))
         return nats_setDefaultError(NATS_INVALID_QUEUE_NAME);
 
     if (lock)
@@ -2936,33 +3028,17 @@ natsConn_subscribeImpl(natsSubscription **newSub,
         // so that we can suppress here.
         if (!natsConn_isReconnecting(nc))
         {
-            char    *proto = NULL;
-            int     res    = 0;
-
-            res = nats_asprintf(&proto, _SUB_PROTO_,
-                                subj,
-                                (queue == NULL ? "" : queue),
-                                (int) sub->sid);
-            if (res < 0)
-                s = nats_setDefaultError(NATS_NO_MEMORY);
-
+            SET_WRITE_DEADLINE(nc);
+            s = natsConn_sendSubProto(nc, subj, queue, sub->sid);
             if (s == NATS_OK)
-            {
-                SET_WRITE_DEADLINE(nc);
-                s = natsConn_bufferWriteString(nc, proto);
-                if (s == NATS_OK)
-                    s = natsConn_flushOrKickFlusher(nc);
+                s = natsConn_flushOrKickFlusher(nc);
 
-                // We should not return a failure if we get an issue
-                // with the buffer write (except if it is no memory).
-                // For IO errors (if we just got disconnected), the
-                // reconnect logic will resend the sub protocol.
-
-                if (s != NATS_NO_MEMORY)
-                    s = NATS_OK;
-            }
-
-            NATS_FREE(proto);
+            // We should not return a failure if we get an issue
+            // with the buffer write (except if it is no memory).
+            // For IO errors (if we just got disconnected), the
+            // reconnect logic will resend the sub protocol.
+            if (s != NATS_NO_MEMORY)
+                s = NATS_OK;
         }
     }
 
@@ -3051,7 +3127,7 @@ natsConn_unsubscribe(natsConnection *nc, natsSubscription *sub, int max, bool dr
         SET_WRITE_DEADLINE(nc);
         // We will send these for all subs when we reconnect
         // so that we can suppress here.
-        s = _sendUnsubProto(nc, sub->sid, max);
+        s = natsConn_sendUnsubProto(nc, sub->sid, max);
         if (s == NATS_OK)
             s = natsConn_flushOrKickFlusher(nc);
 
@@ -3140,6 +3216,17 @@ natsConn_create(natsConnection **newConn, natsOptions *options)
         s = natsCondition_Create(&(nc->pongs.cond));
     if (s == NATS_OK)
         s = natsCondition_Create(&(nc->reconnectCond));
+
+    if (s == NATS_OK)
+    {
+        if (nc->opts->inboxPfx != NULL)
+            nc->inboxPfx = (const char*) nc->opts->inboxPfx;
+        else
+            nc->inboxPfx = NATS_DEFAULT_INBOX_PRE;
+
+        nc->inboxPfxLen = (int) strlen(nc->inboxPfx);
+        nc->reqIdOffset = nc->inboxPfxLen+NUID_BUFFER_LEN+1;
+    }
 
     if (s == NATS_OK)
         *newConn = nc;
@@ -3453,7 +3540,7 @@ _pushDrainErr(natsConnection *nc, natsStatus s, const char *errTxt)
     if (nc->opts->asyncErrCb != NULL)
     {
         char tmp[256];
-        snprintf(tmp, sizeof(tmp), "Drain error: %s: %d (%s)", errTxt, s, natsStatus_GetText(s));
+        snprintf(tmp, sizeof(tmp), "Drain error: %s: %u (%s)", errTxt, s, natsStatus_GetText(s));
         natsAsyncCb_PostErrHandler(nc, NULL, s, NATS_STRDUP(tmp));
     }
     natsConn_Unlock(nc);
@@ -4270,4 +4357,13 @@ natsConnection_GetLocalIPAndPort(natsConnection *nc, char **ip, int *port)
     natsConn_Unlock(nc);
 
     return NATS_UPDATE_ERR_STACK(s);
+}
+
+void
+natsConn_setFilterWithClosure(natsConnection *nc, natsMsgFilter f, void* closure)
+{
+    natsMutex_Lock(nc->subsMu);
+    nc->filter        = f;
+    nc->filterClosure = closure;
+    natsMutex_Unlock(nc->subsMu);
 }

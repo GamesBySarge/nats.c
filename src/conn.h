@@ -131,6 +131,26 @@ natsConn_userFromFile(char **userJWT, char **customErrTxt, void *closure);
 natsStatus
 natsConn_signatureHandler(char **customErrTxt, unsigned char **sig, int *sigLen, const char *nonce, void *closure);
 
+natsStatus
+natsConn_sendSubProto(natsConnection *nc, const char *subject, const char *queue, int64_t sid);
+
+natsStatus
+natsConn_sendUnsubProto(natsConnection *nc, int64_t subId, int max);
+
+#define natsConn_setFilter(c, f) natsConn_setFilterWithClosure((c), (f), NULL)
+
+void
+natsConn_setFilterWithClosure(natsConnection *nc, natsMsgFilter f, void* closure);
+
+natsStatus
+natsConn_initInbox(natsConnection *nc, char *buf, int bufSize, char **newInbox, bool *allocated);
+
+natsStatus
+natsConn_newInbox(natsConnection *nc, natsInbox **newInbox);
+
+bool
+natsConn_srvVersionAtLeast(natsConnection *nc, int major, int minor, int update);
+
 void
 natsConn_close(natsConnection *nc);
 

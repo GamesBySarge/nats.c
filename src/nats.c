@@ -32,8 +32,6 @@
 #include "nkeys.h"
 #include "crypto.h"
 
-static const char *inboxPrefix = "_INBOX.";
-
 #define WAIT_LIB_INITIALIZED \
         natsMutex_Lock(gLib.lock); \
         while (!(gLib.initialized) && !(gLib.initAborted)) \
@@ -1084,42 +1082,26 @@ natsInbox_Create(natsInbox **newInbox)
 {
     natsStatus  s;
     char        *inbox = NULL;
-    char        tmpInbox[NATS_INBOX_ARRAY_SIZE];
+    const int   size   = NATS_DEFAULT_INBOX_PRE_LEN + NUID_BUFFER_LEN + 1;
 
     s = nats_Open(-1);
     if (s != NATS_OK)
         return s;
 
-    sprintf(tmpInbox, "%s", inboxPrefix);
-    s = natsNUID_Next(tmpInbox + NATS_INBOX_PRE_LEN, NUID_BUFFER_LEN + 1);
+    inbox = NATS_MALLOC(size);
+    if (inbox == NULL)
+        return nats_setDefaultError(NATS_NO_MEMORY);
+
+    memcpy(inbox, NATS_DEFAULT_INBOX_PRE, NATS_DEFAULT_INBOX_PRE_LEN);
+    s = natsNUID_Next(inbox + NATS_DEFAULT_INBOX_PRE_LEN, NUID_BUFFER_LEN + 1);
     if (s == NATS_OK)
     {
-        inbox = NATS_STRDUP(tmpInbox);
-        if (inbox == NULL)
-            s = NATS_NO_MEMORY;
+        inbox[size-1] = '\0';
+        *newInbox = (natsInbox*) inbox;
     }
-    if (s == NATS_OK)
-        *newInbox = inbox;
-
-    return s;
-}
-
-natsStatus
-natsInbox_init(char *inbox, int inboxLen)
-{
-    natsStatus s;
-
-    s = nats_Open(-1);
-    if (s != NATS_OK)
-        return s;
-
-    if (inboxLen < (NATS_INBOX_ARRAY_SIZE))
-        return NATS_INSUFFICIENT_BUFFER;
-
-    sprintf(inbox, "%s", inboxPrefix);
-    s = natsNUID_Next(inbox + NATS_INBOX_PRE_LEN, NUID_BUFFER_LEN + 1);
-
-    return s;
+    else
+        NATS_FREE(inbox);
+    return NATS_UPDATE_ERR_STACK(s);
 }
 
 void
@@ -1253,7 +1235,7 @@ nats_GetVersionNumber(void)
 static void
 _versionGetString(char *buffer, size_t bufLen, uint32_t verNumber)
 {
-    snprintf(buffer, bufLen, "%d.%d.%d",
+    snprintf(buffer, bufLen, "%u.%u.%u",
              ((verNumber >> 16) & 0xF),
              ((verNumber >> 8) & 0xF),
              (verNumber & 0xF));
@@ -1593,7 +1575,7 @@ nats_PrintLastErrorStack(FILE *file)
     if ((errTL == NULL) || (errTL->sts == NATS_OK) || (errTL->framesCount == -1))
         return;
 
-    fprintf(file, "Error: %d - %s",
+    fprintf(file, "Error: %u - %s",
             errTL->sts, natsStatus_GetText(errTL->sts));
     if (errTL->text[0] != '\0')
         fprintf(file, " - %s", errTL->text);
@@ -1783,14 +1765,8 @@ _deliverMsgs(void *arg)
 
         delivered = ++(sub->delivered);
 
-        fcReply = NULL;
         jsi = sub->jsi;
-        if ((jsi != NULL) && (jsi->fcDelivered == delivered))
-        {
-            fcReply          = jsi->fcReply;
-            jsi->fcReply     = NULL;
-            jsi->fcDelivered = 0;
-        }
+        fcReply = (jsi == NULL ? NULL : jsSub_checkForFlowControlResponse(sub));
 
         // Is this a subscription that can timeout?
         if (!sub->draining && (sub->timeout != 0))

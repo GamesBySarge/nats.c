@@ -73,7 +73,7 @@ natsMsgHeader_encode(natsBuffer *buf, natsMsg *msg)
     // See explanation in natsMsgHeader_encodedLen()
     if (natsMsg_needsLift(msg))
     {
-        natsBuf_Append(buf, (const char*) msg->hdr, msg->hdrLen);
+        s = natsBuf_Append(buf, (const char*) msg->hdr, msg->hdrLen);
         return NATS_UPDATE_ERR_STACK(s);
     }
 
@@ -680,6 +680,9 @@ natsMsg_Destroy(natsMsg *msg)
     if (msg == NULL)
         return;
 
+    if (natsMsg_isNoDestroy(msg))
+        return;
+
     if (natsGC_collect((natsGCItem *) msg))
         return;
 
@@ -720,6 +723,24 @@ natsMsg_GetDataLength(const natsMsg *msg)
         return 0;
 
     return msg->dataLen;
+}
+
+uint64_t
+natsMsg_GetSequence(natsMsg *msg)
+{
+    if (msg == NULL)
+        return 0;
+
+    return msg->seq;
+}
+
+int64_t
+natsMsg_GetTime(natsMsg *msg)
+{
+    if (msg == NULL)
+        return 0;
+
+    return msg->time;
 }
 
 natsStatus
@@ -765,6 +786,8 @@ natsMsg_create(natsMsg **newMsg,
     msg->headers    = NULL;
     msg->sub        = NULL;
     msg->next       = NULL;
+    msg->seq        = 0;
+    msg->time       = 0;
 
     ptr = (char*) (((char*) &(msg->next)) + sizeof(msg->next));
 
@@ -788,18 +811,22 @@ natsMsg_create(natsMsg **newMsg,
     if (hasHdrs)
     {
         msg->hdr = ptr;
-        memcpy(ptr, buf, hdrLen);
+        if (buf != NULL)
+        {
+            memcpy(ptr, buf, hdrLen);
+            buf += hdrLen;
+        }
         ptr += hdrLen;
         *(ptr++) = '\0';
 
         msg->hdrLen  = hdrLen;
         natsMsg_setNeedsLift(msg);
         dataLen -= hdrLen;
-        buf += hdrLen;
     }
     msg->data    = (const char*) ptr;
     msg->dataLen = dataLen;
-    memcpy(ptr, buf, dataLen);
+    if (buf != NULL)
+        memcpy(ptr, buf, dataLen);
     ptr += dataLen;
     *(ptr) = '\0';
 
@@ -863,7 +890,7 @@ natsMsgList_Destroy(natsMsgList *list)
 {
     int i;
 
-    if (list == NULL)
+    if ((list == NULL) || (list->Msgs == NULL))
         return;
 
     for (i=0; i < list->Count; i++)
