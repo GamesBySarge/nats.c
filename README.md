@@ -9,13 +9,14 @@ This NATS Client implementation is heavily based on the [NATS GO Client](https:/
 [![License Apache 2](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Build Status](https://travis-ci.com/nats-io/nats.c.svg?branch=main)](https://travis-ci.com/github/nats-io/nats.c)
 [![Coverage Status](https://coveralls.io/repos/github/nats-io/nats.c/badge.svg?branch=main)](https://coveralls.io/github/nats-io/nats.c?branch=main)
-[![Release](https://img.shields.io/badge/release-v3.2.0-blue.svg?style=flat)](https://github.com/nats-io/nats.c/releases/tag/v3.2.0)
+[![Release](https://img.shields.io/badge/release-v3.3.0-blue.svg?style=flat)](https://github.com/nats-io/nats.c/releases/tag/v3.3.0)
 [![Documentation](https://img.shields.io/badge/doc-Doxygen-brightgreen.svg?style=flat)](http://nats-io.github.io/nats.c)
 [![Total alerts](https://img.shields.io/lgtm/alerts/g/nats-io/nats.c.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/nats-io/nats.c/alerts/)
 [![Language grade: C/C++](https://img.shields.io/lgtm/grade/cpp/g/nats-io/nats.c.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/nats-io/nats.c/context:cpp)
 
 # Table of Contents
 
+- [Installing](#installing)
 - [Building](#building)
 	* [TLS Support](#tls-support)
         * [Link statically](#link-statically)
@@ -65,6 +66,13 @@ This NATS Client implementation is heavily based on the [NATS GO Client](https:/
 			* [Publisher Rate Limiting](#publisher-rate-limiting)
 			* [Subscriber Rate Limiting](#subscriber-rate-limiting)
 - [License](#license)
+
+## Installing
+
+There are several package managers with NATS C client library available. If you know one that is not in this list, please submit a PR to add it!
+
+- [Homebrew](https://github.com/Homebrew/homebrew-core) The "cnats" formula is [here](https://github.com/Homebrew/homebrew-core/blob/master/Formula/cnats.rb)
+- [vcpkg](https://vcpkg.io) The "cnats" port is [here](https://github.com/microsoft/vcpkg/tree/master/ports/cnats)
 
 ## Building
 
